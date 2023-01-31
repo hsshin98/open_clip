@@ -193,6 +193,21 @@ class ResidualAttentionBlock(nn.Module):
         x = x + self.ls_1(self.attention(self.ln_1(x), attn_mask=attn_mask))
         x = x + self.ls_2(self.mlp(self.ln_2(x)))
         return x
+    
+    def forward_dense(self, x):
+        y = self.ln_1(x)
+        y = F.linear(y, self.attn.in_proj_weight, self.attn.in_proj_bias)
+        L, N, D = y.shape # L N 3D
+        
+        y = y.reshape(L, N, 3, D // 3).permute(2, 1, 0, 3).reshape(3 * N, L, D // 3)
+        y = F.linear(y, self.attn.out_proj.weight, self.attn.out_proj.bias)
+        
+        q, k, v = y.tensor_split(3, dim=0)
+        v = v.transpose(1, 0) + x # L N D
+
+        v = v + self.mlp(self.ln_2(v))
+
+        return v
 
 
 class CustomResidualAttentionBlock(nn.Module):
@@ -261,12 +276,15 @@ class Transformer(nn.Module):
     def get_cast_dtype(self) -> torch.dtype:
         return self.resblocks[0].mlp.c_fc.weight.dtype
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
-        for r in self.resblocks:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, dense=False):
+        for i, r in enumerate(self.resblocks):
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 x = checkpoint(r, x, attn_mask)
             else:
-                x = r(x, attn_mask=attn_mask)
+                if dense and i == self.layers - 1:
+                    x = r.forward_dense(x)
+                else:
+                    x = r(x, attn_mask=attn_mask)
         return x
 
 
@@ -374,7 +392,7 @@ class VisionTransformer(nn.Module):
     def set_grad_checkpointing(self, enable=True):
         self.transformer.grad_checkpointing = enable
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, dense=False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -388,11 +406,13 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        x = self.transformer(x, dense=dense)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         if self.global_average_pool:
             x = x.mean(dim=1)
+        elif dense:
+            x = x
         else:
             x = x[:, 0]
 
